@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Instagram Following Cleaner</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <div id="app">
+
+    <!-- HOME SCREEN -->
+    <section id="screen-home" class="screen active">
+      <header class="brand">
+        <img class="logo" src="icon128.png" alt="Logo" />
+        <div>
+          <h1>Following Cleaner</h1>
+          <p class="tagline">Find who doesn't follow you back</p>
+        </div>
+      </header>
+
+      <div class="status-card">
+        <span id="login-status" class="status-dot pending"></span>
+        <span id="login-text">Checking Instagram session…</span>
+      </div>
+
+      <button id="btn-scan" class="btn primary">Scan My Following</button>
+      <button id="btn-open-ig" class="btn ghost hidden">Open Instagram</button>
+
+      <div class="pro-banner">
+        <div>
+          <strong>Free plan</strong>
+          <p id="quota-line">10 unfollows / day</p>
+        </div>
+        <button id="btn-upgrade" class="btn ghost small">Upgrade to Pro</button>
+      </div>
+
+      <div id="last-scan" class="muted small hidden">
+        Last scan: <span id="last-scan-time"></span>
+        <button id="btn-load-cached" class="link">View results</button>
+      </div>
+
+      <p class="footer-note">Use responsibly. Instagram may rate-limit aggressive activity.</p>
+    </section>
+
+    <!-- LOADING SCREEN -->
+    <section id="screen-loading" class="screen">
+      <h2>Scanning…</h2>
+      <div class="progress-wrap">
+        <div id="progress-bar" class="progress-bar"></div>
+      </div>
+      <p id="loading-text" class="muted">Fetching following list…</p>
+      <p id="loading-detail" class="muted small"></p>
+    </section>
+
+    <!-- RESULTS SCREEN -->
+    <section id="screen-results" class="screen">
+      <div class="summary">
+        <div class="stat"><span id="stat-following">0</span><label>Following</label></div>
+        <div class="stat"><span id="stat-followers">0</span><label>Followers</label></div>
+        <div class="stat highlight"><span id="stat-nonfollowers">0</span><label>Non-followers</label></div>
+      </div>
+
+      <div class="toolbar">
+        <input type="text" id="search-input" placeholder="Search username…" />
+      </div>
+
+      <div class="toolbar">
+        <button id="btn-select-all" class="btn ghost small">Select all</button>
+        <button id="btn-deselect-all" class="btn ghost small">Deselect</button>
+        <span class="spacer"></span>
+        <span id="selected-count" class="muted small">0 selected</span>
+      </div>
+
+      <div id="protected-bar" class="protected-bar hidden">
+        <span class="shield">★</span>
+        <span id="protected-count">0 protected accounts kept safe</span>
+        <span class="spacer"></span>
+        <button id="btn-toggle-protected" class="link">Hide</button>
+      </div>
+
+      <div id="user-list" class="user-list"></div>
+
+      <div class="bottom-actions">
+        <button id="btn-rescan" class="btn ghost">Rescan</button>
+        <button id="btn-unfollow" class="btn danger">Unfollow Selected (0)</button>
+      </div>
+    </section>
+
+    <!-- UNFOLLOWING SCREEN -->
+    <section id="screen-unfollowing" class="screen">
+      <h2>Unfollowing…</h2>
+      <div class="progress-wrap">
+        <div id="unfollow-bar" class="progress-bar"></div>
+      </div>
+      <p id="unfollow-count" class="muted">0 / 0</p>
+      <div class="current-user">
+        <p class="muted small">Currently unfollowing</p>
+        <p id="current-username" class="username-big">—</p>
+        <p id="unfollow-eta" class="muted small"></p>
+      </div>
+      <p id="unfollow-status" class="muted small"></p>
+      <button id="btn-stop" class="btn danger">Stop</button>
+    </section>
+
+    <!-- DONE SCREEN -->
+    <section id="screen-done" class="screen">
+      <div class="done-mark">✓</div>
+      <h2>All done!</h2>
+      <p id="done-summary" class="muted">Unfollowed 0 accounts.</p>
+      <button id="btn-again" class="btn primary">Scan Again</button>
+    </section>
+
+    <!-- ERROR SCREEN -->
+    <section id="screen-error" class="screen">
+      <div class="error-mark">!</div>
+      <h2>Something went wrong</h2>
+      <p id="error-text" class="muted">—</p>
+      <button id="btn-retry" class="btn primary">Retry</button>
+      <button id="btn-error-home" class="btn ghost">Back to Home</button>
+    </section>
+
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

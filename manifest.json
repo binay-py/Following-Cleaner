@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "Instagram Following Cleaner",
+  "version": "1.0",
+  "description": "Find and bulk-unfollow Instagram accounts that don't follow you back.",
+  "permissions": ["activeTab", "scripting", "storage"],
+  "host_permissions": ["https://www.instagram.com/*"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Instagram Following Cleaner",
+    "default_icon": {
+      "16": "icon16.png",
+      "48": "icon48.png",
+      "128": "icon128.png"
+    }
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.instagram.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "icons": {
+    "16": "icon16.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  }
+}
