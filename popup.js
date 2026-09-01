@@ -1,4 +1,8 @@
 // popup.js — UI controller for the extension popup.
+//
+// The popup no longer runs the job. It asks content.js to start one, then
+// renders whatever chrome.storage.local says about it. That means closing the
+// popup mid-scan no longer throws the work away.
 
 const FREE_DAILY_LIMIT = 10;
 const BULK_WARN_THRESHOLD = 100;
@@ -7,12 +11,24 @@ const state = {
   igTabId: null,
   results: null,            // { following_count, followers_count, non_followers, scanned_at }
   selected: new Set(),      // user_ids
-  whitelist: new Set(),     // user_ids the user never wants suggested for unfollow
-  hideProtected: false,     // hide whitelisted rows from the results list
+  whitelist: new Set(),     // user_ids never offered for unfollow
+  hideProtected: false,
   filter: "",
-  unfollowing: false,
-  pendingProfileUrl: null,  // if set, primary action navigates current tab here
+  pendingUrl: null,         // primary button target when we can't scan yet
+  unfollowTotal: 0,
 };
+
+function $(sel) { return document.querySelector(sel); }
+
+function showScreen(id) {
+  document.querySelectorAll(".screen").forEach((s) => s.classList.remove("active"));
+  document.getElementById(id).classList.add("active");
+}
+
+function showError(msg) {
+  $("#error-text").textContent = msg;
+  showScreen("screen-error");
+}
 
 // ---------- whitelist persistence ----------
 async function loadWhitelist() {
@@ -29,44 +45,22 @@ async function toggleWhitelist(uid) {
     state.whitelist.delete(uid);
   } else {
     state.whitelist.add(uid);
-    state.selected.delete(uid); // a protected account can't be queued for unfollow
+    state.selected.delete(uid);
   }
   await saveWhitelist();
   renderResults();
 }
 
-// ---------- screen helpers ----------
-function showScreen(id) {
-  document.querySelectorAll(".screen").forEach((s) => s.classList.remove("active"));
-  document.getElementById(id).classList.add("active");
-}
-
-function $(sel) { return document.querySelector(sel); }
-
-// ---------- Active-tab management ----------
-// The extension is locked to the currently active tab: it only works when that
-// tab is the logged-in user's own profile on instagram.com.
-
+// ---------- tab plumbing ----------
 async function getActiveTab() {
   const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
   return tab || null;
 }
 
 function isInstagramUrl(url) {
-  return typeof url === "string" && url.startsWith("https://www.instagram.com/");
+  return typeof url === "string" && /^https:\/\/(www\.)?instagram\.com\//.test(url);
 }
 
-function isOwnProfileUrl(url, username) {
-  if (!isInstagramUrl(url) || !username) return false;
-  try {
-    const u = new URL(url);
-    const path = u.pathname.replace(/\/+$/, "").toLowerCase();
-    return path === "/" + username.toLowerCase();
-  } catch (_) { return false; }
-}
-
-// Opens the URL in a NEW tab immediately to the right of the current one,
-// leaving the user's existing tab untouched.
 async function openInNextTab(url) {
   const tab = await getActiveTab();
   const opts = { url, active: true };
@@ -74,45 +68,33 @@ async function openInNextTab(url) {
   await chrome.tabs.create(opts);
 }
 
-async function navigateActiveTabTo(url) {
-  await openInNextTab(url);
-}
-
-async function openInstagram() {
-  await openInNextTab("https://www.instagram.com/");
-}
-
-// Used by scan/unfollow flows — talks to the content script in the active tab,
-// which must already be the user's own Instagram profile (gated by the home
-// screen). Will inject the content script on demand if it isn't attached.
+// Sends a message to the content script, injecting it first if it isn't there.
 async function sendToContent(message) {
   const tab = await getActiveTab();
   if (!tab || !isInstagramUrl(tab.url)) {
-    throw new Error("This only works on Instagram. Open instagram.com and try again.");
+    throw new Error("Open instagram.com in this tab and try again.");
   }
   state.igTabId = tab.id;
   try {
     return await chrome.tabs.sendMessage(tab.id, message);
-  } catch (e) {
-    try {
-      await chrome.scripting.executeScript({
-        target: { tabId: tab.id },
-        files: ["content.js"],
-      });
-      await new Promise((r) => setTimeout(r, 300));
-      return await chrome.tabs.sendMessage(tab.id, message);
-    } catch (e2) {
-      throw new Error("Cannot reach the Instagram tab. Reload instagram.com and try again.");
-    }
+  } catch (_) {
+    await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      files: ["content.js"],
+    });
+    await new Promise((r) => setTimeout(r, 300));
+    return await chrome.tabs.sendMessage(tab.id, message);
   }
 }
 
 // ---------- home-screen state machine ----------
-// Four states:
-//   1. Not on instagram.com         → "Open Instagram"
-//   2. On IG but not logged in      → "Log in to Instagram"
-//   3. On IG but wrong page         → "Go to @{username}"
-//   4. On own profile + logged in   → Scan enabled
+// 1. not on instagram.com  -> "Open Instagram"
+// 2. on IG, not logged in  -> "Log in to Instagram"
+// 3. logged in             -> scan enabled
+//
+// The old build also demanded you be sitting on your own profile page. That
+// gate did nothing useful: the API calls are the same from any instagram.com
+// page, and it was the most common reason the button refused to appear.
 async function refreshHomeState() {
   const dot = $("#login-status");
   const text = $("#login-text");
@@ -121,165 +103,198 @@ async function refreshHomeState() {
 
   const setReady = (username) => {
     dot.className = "status-dot ok";
-    text.textContent = `Ready — @${username}'s profile`;
+    text.textContent = `Ready — signed in as @${username}`;
     scanBtn.classList.remove("hidden");
     scanBtn.disabled = false;
     openBtn.classList.add("hidden");
-    state.pendingProfileUrl = null;
+    state.pendingUrl = null;
   };
-  const setPrimaryAction = (statusMsg, btnLabel, profileUrl = null) => {
+
+  const setAction = (statusMsg, btnLabel, url) => {
     dot.className = "status-dot bad";
     text.textContent = statusMsg;
     scanBtn.classList.add("hidden");
     openBtn.classList.remove("hidden", "ghost");
     openBtn.classList.add("primary");
     openBtn.textContent = btnLabel;
-    state.pendingProfileUrl = profileUrl;
+    state.pendingUrl = url || "https://www.instagram.com/";
   };
 
   dot.className = "status-dot pending";
   text.textContent = "Checking current tab…";
   openBtn.classList.add("hidden");
   scanBtn.classList.remove("hidden");
+  scanBtn.disabled = true;
 
   const tab = await getActiveTab();
-
-  // State 1: not on Instagram
   if (!tab || !isInstagramUrl(tab.url)) {
-    setPrimaryAction("Open Instagram to use this extension.", "Open Instagram");
+    setAction("Open Instagram to use this extension.", "Open Instagram");
     return;
   }
-
   state.igTabId = tab.id;
 
-  // Ping content script (inject if needed) and get session + username
   let info;
   try {
-    info = await chrome.tabs.sendMessage(tab.id, { type: "ping" });
+    info = await sendToContent({ type: "ping" });
   } catch (_) {
-    try {
-      await chrome.scripting.executeScript({
-        target: { tabId: tab.id }, files: ["content.js"],
-      });
-      await new Promise((r) => setTimeout(r, 350));
-      info = await chrome.tabs.sendMessage(tab.id, { type: "ping" });
-    } catch (_) {
-      setPrimaryAction("Reload Instagram and try again.", "Reload Instagram");
-      return;
+    setAction("Reload Instagram and try again.", "Reload Instagram", tab.url);
+    return;
+  }
+
+  if (!info || !info.ok || !info.loggedIn) {
+    setAction("You're not logged in to Instagram.", "Log in to Instagram");
+    return;
+  }
+  if (!info.username) {
+    setAction("Couldn't verify your account. Reload Instagram.", "Reload Instagram", tab.url);
+    return;
+  }
+
+  setReady(info.username);
+}
+
+// ---------- job rendering ----------
+function renderScanProgress(p) {
+  const loaded = p.loaded || 0;
+  const total = p.total || 0;
+  const phaseIsFollowing = p.phase !== "followers";
+
+  // following occupies 0-50% of the bar, followers 50-100%
+  let pct;
+  if (total > 0) {
+    const within = Math.min(1, loaded / total);
+    pct = phaseIsFollowing ? within * 50 : 50 + within * 50;
+  } else {
+    pct = phaseIsFollowing ? 25 : 75;
+  }
+  $("#progress-bar").style.width = `${Math.max(3, Math.min(99, pct))}%`;
+
+  const label = phaseIsFollowing ? "following" : "followers";
+  $("#loading-text").textContent = total
+    ? `Fetching ${label}… ${loaded} of ${total}`
+    : `Fetching ${label}… ${loaded}`;
+  $("#loading-detail").textContent = p.notice || (p.page ? `Page ${p.page}` : "");
+}
+
+function renderUnfollowProgress(p) {
+  const total = p.total || state.unfollowTotal || 1;
+  const done = p.done || 0;
+  $("#unfollow-bar").style.width = `${(done / total) * 100}%`;
+  $("#unfollow-count").textContent = `${done} / ${total}`;
+  $("#current-username").textContent = p.username ? "@" + p.username : "—";
+  $("#unfollow-status").textContent = p.notice || "";
+
+  const remaining = Math.max(0, total - done);
+  if (remaining > 0) {
+    const seconds = Math.round(remaining * 5.5);
+    const min = Math.floor(seconds / 60);
+    const sec = seconds % 60;
+    $("#unfollow-eta").textContent = `~${min > 0 ? `${min}m ` : ""}${sec}s remaining`;
+  } else {
+    $("#unfollow-eta").textContent = "Finishing up…";
+  }
+}
+
+async function applyJob(job, { allowJump }) {
+  if (!job) return;
+  const p = job.progress || {};
+
+  if (job.status === "running") {
+    if (job.type === "scan") {
+      if (allowJump) showScreen("screen-loading");
+      renderScanProgress(p);
+    } else {
+      if (allowJump) showScreen("screen-unfollowing");
+      state.unfollowTotal = p.total || state.unfollowTotal;
+      renderUnfollowProgress(p);
+    }
+    return;
+  }
+
+  if (job.status === "error") {
+    if (allowJump) showError(job.error || "Something went wrong.");
+    return;
+  }
+
+  if (job.status === "done" && allowJump) {
+    if (job.type === "scan") {
+      state.results = job.result;
+      state.selected.clear();
+      renderResults();
+      showScreen("screen-results");
+    } else {
+      const r = job.result || { ok: [], failed: [], stopped: false };
+      const okCount = r.ok.length;
+      const failCount = r.failed.length;
+      const { last_scan } = await chrome.storage.local.get("last_scan");
+      if (last_scan) state.results = last_scan;
+      state.selected.clear();
+      $("#done-summary").textContent =
+        `Unfollowed ${okCount} account(s).` +
+        (failCount ? ` Failed: ${failCount}.` : "") +
+        (r.stopped ? " (Stopped early.)" : "");
+      showScreen("screen-done");
+      refreshQuotaLine();
     }
   }
+}
 
-  // State 2: not logged in
-  if (!info || !info.ok || !info.loggedIn) {
-    setPrimaryAction("You're not logged in to Instagram.", "Log in to Instagram");
-    return;
-  }
+// React to job updates written by the content script.
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== "local" || !changes.job) return;
+  startWatchdog();
+  applyJob(changes.job.newValue, { allowJump: true });
+});
 
-  const username = info.username;
-  if (!username) {
-    setPrimaryAction("Couldn't verify your account. Reload Instagram.", "Reload Instagram");
-    return;
-  }
+// A running job writes to storage constantly. If it goes quiet for longer than
+// this, the content script died (page reloaded, tab closed) and nobody is
+// coming back to finish it.
+const STALE_AFTER_MS = 90000;
+let watchdogTimer = null;
 
-  // State 3: on IG but not the user's own profile page
-  if (!isOwnProfileUrl(tab.url, username)) {
-    const profileUrl = `https://www.instagram.com/${username}/`;
-    setPrimaryAction(
-      `Open your profile to scan it.`,
-      `Go to @${username}`,
-      profileUrl
-    );
-    return;
-  }
-
-  // State 4: ready
-  setReady(username);
+function startWatchdog() {
+  clearTimeout(watchdogTimer);
+  watchdogTimer = setTimeout(async () => {
+    const { job } = await chrome.storage.local.get("job");
+    if (!job || job.status !== "running") return;
+    if (Date.now() - (job.updated_at || 0) < STALE_AFTER_MS) {
+      startWatchdog();
+      return;
+    }
+    await chrome.storage.local.set({
+      job: {
+        ...job,
+        status: "error",
+        error: "Lost contact with the Instagram tab. Reload it and try again.",
+        updated_at: Date.now(),
+      },
+    });
+  }, STALE_AFTER_MS + 1000);
 }
 
 // ---------- scan flow ----------
 async function startScan() {
-  // Pre-flight: re-verify the active tab still matches the gate. If anything
-  // drifted (user switched tabs, navigated away, signed out), send them back
-  // through the home-screen state machine rather than failing mid-scan.
-  const tab = await getActiveTab();
-  if (!tab || !isInstagramUrl(tab.url)) {
-    await refreshHomeState();
-    return;
-  }
-  state.igTabId = tab.id;
-  try {
-    const ping = await chrome.tabs.sendMessage(tab.id, { type: "ping" });
-    if (
-      !ping || !ping.ok || !ping.loggedIn ||
-      !isOwnProfileUrl(tab.url, ping.username)
-    ) {
-      await refreshHomeState();
-      return;
-    }
-  } catch (_) {
-    // content script not injected — sendToContent will inject it.
-  }
-
   showScreen("screen-loading");
-  $("#progress-bar").style.width = "10%";
-  $("#loading-text").textContent = "Fetching your following list…";
+  $("#progress-bar").style.width = "3%";
+  $("#loading-text").textContent = "Starting…";
   $("#loading-detail").textContent = "";
 
   try {
     const res = await sendToContent({ type: "scan" });
-    if (!res || !res.ok) throw new Error(res && res.error || "Scan failed");
-    state.results = res.data;
-    await chrome.storage.local.set({ last_scan: res.data });
-    renderResults();
-    showScreen("screen-results");
+    if (!res || !res.ok) throw new Error((res && res.error) || "Scan failed to start.");
   } catch (e) {
     showError(e.message || String(e));
   }
 }
 
-// ---------- progress listener ----------
-chrome.runtime.onMessage.addListener((msg) => {
-  if (!msg || msg.type !== "progress") return;
-  const p = msg.payload || {};
-  if (p.stage === "fetching_following") {
-    $("#progress-bar").style.width = "35%";
-    $("#loading-text").textContent = `Fetching following… ${p.loaded}`;
-    $("#loading-detail").textContent = `Page ${p.page}`;
-  } else if (p.stage === "start_followers") {
-    $("#progress-bar").style.width = "55%";
-    $("#loading-text").textContent = "Fetching your followers…";
-  } else if (p.stage === "fetching_followers") {
-    const pct = Math.min(95, 55 + Math.min(40, p.loaded / 50));
-    $("#progress-bar").style.width = `${pct}%`;
-    $("#loading-text").textContent = `Fetching followers… ${p.loaded}`;
-    $("#loading-detail").textContent = `Page ${p.page}`;
-  } else if (p.stage === "rate_limited") {
-    $("#loading-detail").textContent = p.message || "Rate limited, waiting…";
-    $("#unfollow-status").textContent = p.message || "Rate limited, waiting…";
-  } else if (p.stage === "unfollowing") {
-    const total = p.total || 1;
-    const done = p.index || 0;
-    const pct = (done / total) * 100;
-    $("#unfollow-bar").style.width = `${pct}%`;
-    $("#unfollow-count").textContent = `${done + 1} / ${total}`;
-    $("#current-username").textContent = "@" + (p.username || "—");
-    $("#unfollow-status").textContent = "";
-    const remaining = Math.max(0, total - done - 1);
-    if (remaining > 0) {
-      const seconds = Math.round(remaining * 5.5);
-      const min = Math.floor(seconds / 60);
-      const sec = seconds % 60;
-      $("#unfollow-eta").textContent =
-        `~${min > 0 ? `${min}m ` : ""}${sec}s remaining`;
-    } else {
-      $("#unfollow-eta").textContent = "Finishing up…";
-    }
-  }
-});
-
 // ---------- results rendering ----------
 function renderResults() {
   const r = state.results;
+  if (!r || !Array.isArray(r.non_followers)) {
+    showError("No scan results yet. Run a scan first.");
+    return;
+  }
+
   $("#stat-following").textContent = r.following_count;
   $("#stat-followers").textContent = r.followers_count;
   $("#stat-nonfollowers").textContent = r.non_followers.length;
@@ -335,7 +350,6 @@ function renderResults() {
     info.appendChild(uname);
     info.appendChild(fname);
 
-    // star — toggles whitelist (protected) status
     const star = document.createElement("button");
     star.className = "star-btn";
     star.textContent = isProtected ? "★" : "☆";
@@ -370,7 +384,7 @@ function renderResults() {
 }
 
 function filteredUsers() {
-  if (!state.results) return [];
+  if (!state.results || !Array.isArray(state.results.non_followers)) return [];
   let list = state.results.non_followers;
   const f = state.filter.trim().toLowerCase();
   if (f) {
@@ -387,7 +401,7 @@ function filteredUsers() {
 }
 
 function protectedInResults() {
-  if (!state.results) return 0;
+  if (!state.results || !Array.isArray(state.results.non_followers)) return 0;
   let n = 0;
   for (const u of state.results.non_followers) {
     if (state.whitelist.has(u.user_id)) n++;
@@ -396,7 +410,7 @@ function protectedInResults() {
 }
 
 function toggleSelected(uid, row) {
-  if (state.whitelist.has(uid)) return; // protected accounts aren't selectable
+  if (state.whitelist.has(uid)) return;
   if (state.selected.has(uid)) {
     state.selected.delete(uid);
     row.classList.remove("selected");
@@ -429,24 +443,20 @@ function updateProtectedBar() {
   $("#btn-toggle-protected").textContent = state.hideProtected ? "Show" : "Hide";
 }
 
-// ---------- daily limit (free plan) ----------
+// ---------- daily limit ----------
+// Padded to match the key content.js writes, so the two agree on what "today"
+// means. The old build built the key without padding and disagreed with itself.
 function todayKey() {
   const d = new Date();
-  return `unfollow_count_${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `unfollow_count_${d.getFullYear()}-${mm}-${dd}`;
 }
 
 async function getTodayCount() {
   const key = todayKey();
   const obj = await chrome.storage.local.get(key);
   return obj[key] || 0;
-}
-
-async function bumpTodayCount(n) {
-  const key = todayKey();
-  const obj = await chrome.storage.local.get(key);
-  const next = (obj[key] || 0) + n;
-  await chrome.storage.local.set({ [key]: next });
-  return next;
 }
 
 async function checkProStatus() {
@@ -460,7 +470,7 @@ async function startUnfollow() {
 
   const isPro = await checkProStatus();
   const todayCount = await getTodayCount();
-  // Protected accounts are never unfollowed, even if somehow still selected.
+
   const targets = state.results.non_followers.filter(
     (u) => state.selected.has(u.user_id) && !state.whitelist.has(u.user_id)
   );
@@ -469,9 +479,7 @@ async function startUnfollow() {
   if (!isPro) {
     const remaining = Math.max(0, FREE_DAILY_LIMIT - todayCount);
     if (remaining === 0) {
-      alert(
-        `Free plan limit reached: ${FREE_DAILY_LIMIT} unfollows/day. Upgrade to Pro for unlimited.`
-      );
+      alert(`Free plan limit reached: ${FREE_DAILY_LIMIT} unfollows/day.`);
       return;
     }
     if (targets.length > remaining) {
@@ -483,65 +491,33 @@ async function startUnfollow() {
     }
   }
 
-  if (targets.length > BULK_WARN_THRESHOLD) {
-    const ok = confirm(
-      `You're about to unfollow ${targets.length} accounts in one go. ` +
-      `Instagram may flag heavy activity. Continue?`
-    );
-    if (!ok) return;
-  } else {
-    const ok = confirm(`Unfollow ${targets.length} account(s)?`);
-    if (!ok) return;
-  }
+  const message =
+    targets.length > BULK_WARN_THRESHOLD
+      ? `You're about to unfollow ${targets.length} accounts in one go. Instagram may flag heavy activity. Continue?`
+      : `Unfollow ${targets.length} account(s)?`;
+  if (!confirm(message)) return;
 
-  state.unfollowing = true;
+  state.unfollowTotal = targets.length;
   showScreen("screen-unfollowing");
   $("#unfollow-bar").style.width = "0%";
   $("#unfollow-count").textContent = `0 / ${targets.length}`;
   $("#current-username").textContent = "—";
   $("#unfollow-status").textContent = "";
+  $("#unfollow-eta").textContent = "";
 
   try {
     const res = await sendToContent({ type: "unfollow", targets });
-    if (!res || !res.ok) throw new Error(res && res.error || "Unfollow failed");
-    const okCount = res.data.ok.length;
-    const failCount = res.data.failed.length;
-    if (!isPro) await bumpTodayCount(okCount);
-
-    // remove unfollowed users from local results so user can rescan or continue
-    const okSet = new Set(res.data.ok);
-    state.results.non_followers = state.results.non_followers.filter(
-      (u) => !okSet.has(u.user_id)
-    );
-    state.results.following_count = Math.max(
-      0,
-      state.results.following_count - okCount
-    );
-    state.selected.clear();
-    await chrome.storage.local.set({ last_scan: state.results });
-
-    $("#done-summary").textContent =
-      `Unfollowed ${okCount} account(s).` +
-      (failCount ? ` Failed: ${failCount}.` : "") +
-      (res.data.stopped ? " (Stopped early.)" : "");
-    showScreen("screen-done");
+    if (!res || !res.ok) throw new Error((res && res.error) || "Unfollow failed to start.");
   } catch (e) {
     showError(e.message || String(e));
-  } finally {
-    state.unfollowing = false;
   }
 }
 
 async function stopUnfollow() {
+  $("#unfollow-status").textContent = "Stopping after the current account…";
   try {
     await sendToContent({ type: "stop" });
   } catch (_) { /* ignore */ }
-}
-
-// ---------- error screen ----------
-function showError(msg) {
-  $("#error-text").textContent = msg;
-  showScreen("screen-error");
 }
 
 // ---------- cached scan ----------
@@ -563,14 +539,15 @@ async function loadLastScanIndicator() {
     $("#last-scan-time").textContent = relativeTime(last_scan.scanned_at);
     $("#last-scan").classList.remove("hidden");
     state.results = last_scan;
+  } else {
+    $("#last-scan").classList.add("hidden");
   }
 }
 
 async function refreshQuotaLine() {
-  const isPro = await checkProStatus();
   const line = $("#quota-line");
   if (!line) return;
-  if (isPro) {
+  if (await checkProStatus()) {
     line.textContent = "Unlimited unfollows";
     return;
   }
@@ -579,31 +556,36 @@ async function refreshQuotaLine() {
   line.textContent = `${left} of ${FREE_DAILY_LIMIT} unfollows left today`;
 }
 
-// ---------- wire up ----------
-document.addEventListener("DOMContentLoaded", () => {
+async function goHome() {
+  state.selected.clear();
   showScreen("screen-home");
-  loadWhitelist();
-  loadLastScanIndicator();
-  refreshQuotaLine();
-  refreshHomeState();
+  await loadLastScanIndicator();
+  await refreshQuotaLine();
+  await refreshHomeState();
+}
+
+// ---------- boot ----------
+document.addEventListener("DOMContentLoaded", async () => {
+  showScreen("screen-home");
+  await loadWhitelist();
+  await loadLastScanIndicator();
+  await refreshQuotaLine();
+
+  // If a job was running when the popup was last closed, rejoin it instead of
+  // showing a stale home screen.
+  const { job } = await chrome.storage.local.get("job");
+  if (job && job.status === "running") {
+    startWatchdog();
+    await applyJob(job, { allowJump: true });
+  } else {
+    await refreshHomeState();
+  }
 
   $("#btn-scan").addEventListener("click", startScan);
   $("#btn-rescan").addEventListener("click", startScan);
-  $("#btn-again").addEventListener("click", () => {
-    state.selected.clear();
-    showScreen("screen-home");
-    refreshQuotaLine();
-    loadLastScanIndicator();
-    refreshHomeState();
-  });
-  $("#btn-retry").addEventListener("click", () => {
-    showScreen("screen-home");
-    refreshHomeState();
-  });
-  $("#btn-error-home").addEventListener("click", () => {
-    showScreen("screen-home");
-    refreshHomeState();
-  });
+  $("#btn-again").addEventListener("click", goHome);
+  $("#btn-retry").addEventListener("click", goHome);
+  $("#btn-error-home").addEventListener("click", goHome);
 
   $("#btn-load-cached").addEventListener("click", () => {
     if (state.results) {
@@ -618,12 +600,12 @@ document.addEventListener("DOMContentLoaded", () => {
     }
     renderResults();
   });
-  $("#btn-toggle-protected").addEventListener("click", () => {
-    state.hideProtected = !state.hideProtected;
-    renderResults();
-  });
   $("#btn-deselect-all").addEventListener("click", () => {
     state.selected.clear();
+    renderResults();
+  });
+  $("#btn-toggle-protected").addEventListener("click", () => {
+    state.hideProtected = !state.hideProtected;
     renderResults();
   });
 
@@ -639,15 +621,8 @@ document.addEventListener("DOMContentLoaded", () => {
     alert("Pro upgrade is coming soon!");
   });
 
-  // Single button serves two purposes depending on state:
-  // - pendingProfileUrl set → navigate active tab to the user's own profile
-  // - otherwise            → open Instagram in the active tab
   $("#btn-open-ig").addEventListener("click", async () => {
-    if (state.pendingProfileUrl) {
-      await navigateActiveTabTo(state.pendingProfileUrl);
-    } else {
-      await openInstagram();
-    }
+    await openInNextTab(state.pendingUrl || "https://www.instagram.com/");
     window.close();
   });
 });
