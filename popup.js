@@ -232,7 +232,8 @@ async function applyJob(job, { allowJump }) {
       $("#done-summary").textContent =
         `Unfollowed ${okCount} account(s).` +
         (failCount ? ` Failed: ${failCount}.` : "") +
-        (r.stopped ? " (Stopped early.)" : "");
+        (r.stopped ? " (Stopped early.)" : "") +
+        (r.aborted ? ` ${r.aborted}` : "");
       showScreen("screen-done");
       refreshQuotaLine();
     }
@@ -584,8 +585,19 @@ document.addEventListener("DOMContentLoaded", async () => {
   $("#btn-scan").addEventListener("click", startScan);
   $("#btn-rescan").addEventListener("click", startScan);
   $("#btn-again").addEventListener("click", goHome);
-  $("#btn-retry").addEventListener("click", goHome);
   $("#btn-error-home").addEventListener("click", goHome);
+
+  // Retry re-runs a failed scan. A failed unfollow run is not replayed
+  // automatically — the selection that produced it is gone, and silently
+  // re-firing unfollows is not something to do on the user's behalf.
+  $("#btn-retry").addEventListener("click", async () => {
+    const { job } = await chrome.storage.local.get("job");
+    if (job && job.type === "unfollow" && job.status === "error") {
+      await goHome();
+      return;
+    }
+    await startScan();
+  });
 
   $("#btn-load-cached").addEventListener("click", () => {
     if (state.results) {

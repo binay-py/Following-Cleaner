@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Instagram Following Cleaner",
-  "version": "1.1",
+  "version": "1.2",
   "description": "Find and bulk-unfollow Instagram accounts that don't follow you back.",
   "permissions": ["tabs", "scripting", "storage"],
   "host_permissions": [
