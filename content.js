@@ -16,11 +16,25 @@
   const IG_APP_ID = "936619743392459";
   const PAGE_SIZE = 50;          // IG silently caps this well below 200
   const MAX_RATE_LIMIT_RETRIES = 5;
+  // Runaway guard, not a practical cap: 5000 pages is ~250k accounts, far past
+  // anything this tool can walk in one sitting.
+  const MAX_PAGES = 5000;
+  const MAX_CONSECUTIVE_UNFOLLOW_FAILURES = 5;
 
   // ---------- helpers ----------
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const randomDelay = (min, max) =>
     sleep(Math.floor(Math.random() * (max - min + 1) + min));
+
+  // A rate-limit pause is a whole minute. Sleeping it in one go made Stop feel
+  // broken, so wake up often enough to notice the request.
+  async function interruptibleSleep(ms) {
+    const step = 500;
+    for (let waited = 0; waited < ms; waited += step) {
+      if (stopRequested) return;
+      await sleep(Math.min(step, ms - waited));
+    }
+  }
 
   function getCookie(name) {
     const m = document.cookie.match(
@@ -189,6 +203,11 @@
   async function fetchFriendships(userId, kind, onPage) {
     const path = kind === "following" ? "following" : "followers";
     const out = [];
+    // IG's paginated friendship lists overlap: an account that moves between
+    // pages while we walk them comes back twice. Deduping here keeps the counts
+    // honest and stops the same person being unfollowed twice in one run.
+    const seenUsers = new Set();
+    const seenCursors = new Set();
     let cursor = null;
     let page = 0;
 
@@ -203,8 +222,13 @@
       const users = data.users || [];
 
       for (const u of users) {
+        const id = u.pk ?? u.pk_id ?? u.id;
+        if (id === null || id === undefined || !u.username) continue;
+        const uid = String(id);
+        if (seenUsers.has(uid)) continue;
+        seenUsers.add(uid);
         out.push({
-          user_id: String(u.pk ?? u.pk_id ?? u.id),
+          user_id: uid,
           username: u.username,
           full_name: u.full_name || "",
           profile_pic_url: u.profile_pic_url || "",
@@ -216,6 +240,16 @@
 
       cursor = nextCursor(data);
       if (!cursor || users.length === 0) break;
+      // A cursor we have already followed would replay the same page forever.
+      if (seenCursors.has(cursor)) break;
+      seenCursors.add(cursor);
+      // Never truncate quietly. A short followers list turns real followers
+      // into "non-followers", and those are what the user then unfollows.
+      if (page >= MAX_PAGES) {
+        throw new Error(
+          `Your ${path} list is larger than this extension can walk in one run.`
+        );
+      }
       await randomDelay(800, 1600);
     }
     return out;
@@ -290,6 +324,8 @@
     stopRequested = false;
     const okIds = [];
     const failed = [];
+    let consecutiveFailures = 0;
+    let aborted = null;
 
     for (let i = 0; i < targets.length; i++) {
       if (stopRequested) break;
@@ -302,21 +338,40 @@
         notice: "",
       });
 
+      let succeeded = false;
       try {
         await unfollowUser(t.user_id);
-        okIds.push(t.user_id);
+        succeeded = true;
       } catch (e) {
         if (e && e.code === 429) {
           progress({ notice: "Rate limited, pausing 60s…" });
-          await sleep(60000);
+          await interruptibleSleep(60000);
+          if (stopRequested) break;
+          progress({ notice: "" });
           try {
             await unfollowUser(t.user_id);
-            okIds.push(t.user_id);
+            succeeded = true;
           } catch (e2) {
-            failed.push({ user_id: t.user_id, error: String(e2.message || e2) });
+            failed.push({ user_id: t.user_id, username: t.username, error: String((e2 && e2.message) || e2) });
           }
         } else {
-          failed.push({ user_id: t.user_id, error: String((e && e.message) || e) });
+          failed.push({ user_id: t.user_id, username: t.username, error: String((e && e.message) || e) });
+        }
+      }
+
+      if (succeeded) {
+        okIds.push(t.user_id);
+        consecutiveFailures = 0;
+        // Counted one at a time rather than once at the end: a page reload
+        // mid-run used to discard the whole tally and hand back a fresh quota.
+        await bumpTodayCount(1);
+      } else {
+        consecutiveFailures++;
+        if (consecutiveFailures >= MAX_CONSECUTIVE_UNFOLLOW_FAILURES) {
+          // Instagram refusing this many in a row means the account is being
+          // action-blocked. Grinding through the rest only digs the hole deeper.
+          aborted = "Instagram refused several unfollows in a row, so the run stopped early. Wait a while before trying again.";
+          break;
         }
       }
 
@@ -327,8 +382,6 @@
         await randomDelay(3000, 8000);
       }
     }
-
-    await bumpTodayCount(okIds.length);
 
     // Prune the cached scan so a reopened popup shows the truth
     try {
@@ -346,7 +399,7 @@
       }
     } catch (_) { /* non-fatal */ }
 
-    return { ok: okIds, failed, stopped: stopRequested };
+    return { ok: okIds, failed, stopped: stopRequested, aborted };
   }
 
   // Starts a job in the background and returns immediately. All further
